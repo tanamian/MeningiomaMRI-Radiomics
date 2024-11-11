@@ -1,0 +1,1410 @@
+---
+title: "Multi-parameter MRI radiomics model in predicting postoperative progressive cerebral edema and hemorrhage after resection of meningioma"
+date: "2023-12-26"
+output: html_document
+---
+
+#Radiomics Prediction function
+```{r}
+library(glmnet)
+library(e1071)
+library(pROC)
+
+# Function definition
+calculate_metrics <- function(data, k = 3) {
+    # Store results
+    results <- data.frame(Fold = integer(), 
+                          Dataset = character(), 
+                          Accuracy = numeric(), 
+                          Sensitivity = numeric(),
+                          Specificity = numeric(), 
+                          AUC = numeric(), 
+                          stringsAsFactors = FALSE)
+
+    # Create k-fold cross-validation folds
+    set.seed(47)  # Set random seed
+    folds <- createFolds(factor(data$Group), k = k, list = TRUE, returnTrain = FALSE)
+
+    # Loop through each fold
+    for (j in 1:k) {
+        test <- data[folds[[j]], ]  # Validation set
+        train <- data[-folds[[j]], ]  # Training set
+        #print(test)
+        train_y <- train$Group
+        test_y <- test$Group
+        print(table(train_y))
+        print(table(test_y))
+        num_columns <- ncol(train) 
+        print(num_columns)
+        x <- train[, 2:num_columns]
+        P=0.1
+        y=train[,1]
+        y1=test[,1]
+        n <- vector()
+        
+        for (i in 1:(num_columns-1)) { 
+            a <- wilcox.test(x[, i] ~ y, alternative = c("two.sided"))
+            n[i] <- a$p.value
+        }
+        
+        index = which(n < P)
+        MN = x[,c(index)] 
+        x1=as.matrix(MN)
+        set.seed(t)
+        cv.fit<-cv.glmnet(x1,y,family="binomial",type.measure="auc",nfolds = 10) 
+        fit<-glmnet(x1,y,family="binomial", nlambda=100, alpha=1)
+        coefficients<-coef(fit,s=cv.fit$lambda.min)
+        Active.Index<-which(coefficients!=0)
+        Active.Index <- Active.Index[-1]
+        Active.coefficients<-coefficients[Active.Index]   
+        Active.coefficients
+        Lasso_train=x1[,c(Active.Index-1)]
+        Lasso_test=test[, colnames(test) %in% colnames(Lasso_train)]
+        Lasso_train=train[, colnames(train) %in% colnames(Lasso_train)]
+        print(row.names(coefficients)[Active.Index])
+        row.names(coefficients)[Active.Index]
+        train_data <- data.frame(Lasso_train)
+        test_data <- data.frame(Lasso_test)
+        train_data$Rad_score <- 0
+        test_data$Rad_score <- 0
+
+        for (i in 1:nrow(train_data)) {
+          score <- sum(train_data[i, ] * Active.coefficients)
+           train_data$Rad_score[i] <- score
+          }
+
+        for (i in 1:nrow(test_data)) {
+         score <- sum(test_data[i, ] * Active.coefficients)
+          test_data$Rad_score[i] <- score
+        }
+        dd <- datadist(train_data)
+        options(datadist='dd')
+       f_lrm <- svm(train_y ~ Rad_score, data=train_data,prob=TRUE,kernel = "linear")
+        #f_lrm <- lrm(train_y ~ Rad_score, data=train_data,x=TRUE, y=TRUE,maxit=100)
+
+  
+        pred_f_training <- predict(f_lrm, train_data)
+        modelroc_train <- roc(train_y, pred_f_training)
+       
+        confusion_mat_train <- table(train_y, pred_f_training > e)
+        accuracy_train <- (confusion_mat_train[1, 1] + confusion_mat_train[2, 2]) / sum(confusion_mat_train)
+        sensitivity_train <- confusion_mat_train[2, 2] / (confusion_mat_train[2, 1] + confusion_mat_train[2, 2])
+        specificity_train <- confusion_mat_train[1, 1] / (confusion_mat_train[1, 1] + confusion_mat_train[1, 2])
+        auc_train <- auc(modelroc_train)
+
+
+        pred_f_test <- predict(f_lrm, test_data)
+        modelroc_test <- roc(test_y, pred_f_test)
+         print(pred_f_test )
+
+        confusion_mat_test <- table(test_y, pred_f_test > e)
+        accuracy_test <- (confusion_mat_test[1, 1] + confusion_mat_test[2, 2]) / sum(confusion_mat_test)
+        sensitivity_test <- confusion_mat_test[2, 2] / (confusion_mat_test[2, 1] + confusion_mat_test[2, 2])
+        specificity_test <- confusion_mat_test[1, 1] / (confusion_mat_test[1, 1] + confusion_mat_test[1, 2])
+        auc_test <- auc(modelroc_test)
+
+
+        results <- rbind(results, data.frame(Fold = j, 
+                                              Dataset = "Training", 
+                                              Accuracy = accuracy_train, 
+                                              Sensitivity = sensitivity_train,
+                                              Specificity = specificity_train, 
+                                              AUC = auc_train))
+        
+
+        results <- rbind(results, data.frame(Fold = j, 
+                                              Dataset = "Testing", 
+                                              Accuracy = accuracy_test, 
+                                              Sensitivity = sensitivity_test,
+                                              Specificity = specificity_test, 
+                                              AUC = auc_test))
+    }
+
+
+    return(results)
+}
+
+
+```
+
+#Clinical data prediction function
+```{r}
+evaluate_model_performance <- function(model, train_data, train_labels, test_data, test_labels, threshold = 0.1, output_file = "model_performance.csv") {
+
+  pred_train <- predict(model, train_data)
+  roc_train <- roc(train_labels, pred_train)
+  confusion_train <- table(train_labels, pred_train > threshold)
+  accuracy_train <- (confusion_train[1,1] + confusion_train[2,2]) / sum(confusion_train)
+  sensitivity_train <- confusion_train[2,2] / (confusion_train[2,1] + confusion_train[2,2])
+  specificity_train <- confusion_train[1,1] / (confusion_train[1,1] + confusion_train[1,2])
+  auc_train <- auc(roc_train)
+  ci_train <- ci(roc_train)
+  
+
+  pred_test <- predict(model, test_data)
+  roc_test <- roc(test_labels, pred_test)
+  confusion_test <- table(test_labels, pred_test > threshold)
+  accuracy_test <- (confusion_test[1,1] + confusion_test[2,2]) / sum(confusion_test)
+  sensitivity_test <- confusion_test[2,2] / (confusion_test[2,1] + confusion_test[2,2])
+  specificity_test <- confusion_test[1,1] / (confusion_test[1,1] + confusion_test[1,2])
+  auc_test <- auc(roc_test)
+  ci_test <- ci(roc_test)
+  
+  
+
+  performance_data <- data.frame(
+    Dataset = c("Train", "Test"),
+    Accuracy = c(accuracy_train, accuracy_test),
+    Sensitivity = c(sensitivity_train, sensitivity_test),
+    Specificity = c(specificity_train, specificity_test),
+    AUC = c(auc_train, auc_test)
+  )
+  
+
+  if (file.exists(output_file)) {
+    write.table(performance_data, file = output_file, sep = ",", col.names = FALSE, row.names = FALSE, append = TRUE)
+  } else {
+    write.table(performance_data, file = output_file, sep = ",", col.names = TRUE, row.names = FALSE)
+  }
+  
+
+  return(list(
+    train = list(accuracy = accuracy_train, sensitivity = sensitivity_train, specificity = specificity_train, auc = auc_train, ci = ci_train),
+    test = list(accuracy = accuracy_test, sensitivity = sensitivity_test, specificity = specificity_test, auc = auc_test, ci = ci_test)
+  ))
+}
+
+```
+
+
+#ADC edema
+```{r}
+
+data2 <- read.csv("Part1_ADC_SZ_features.csv")
+data2 <- data2[, -2]
+NEWdata <- data2
+continuous_vars <- NEWdata[, c(2:974)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:974)] <- normalized_vars
+e=0.6
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "ADC_SZ.csv", row.names = FALSE)
+```
+
+##T2WI edema
+```{r}
+data5<-read.csv("Part1_OAX_T2_SZ_features.csv")
+data5<-data5[,-2]
+data5<-data5[,-3]
+NEWdata<-data5
+continuous_vars <- NEWdata[, c(2:973)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:973)] <- normalized_vars
+
+e=0.6
+t=2
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T2WI_SZ.csv", row.names = FALSE)
+```
+
+#T1CE edema
+```{r}
+data6<-read.csv("Part1_OCOR_T1+C_SZ_features.csv")
+data6<-data6[,-2]
+NEWdata<-data6
+continuous_vars <- NEWdata[, c(2:974)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:974)] <- normalized_vars
+
+e=0.65
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T1CE_SZ.csv", row.names = FALSE)
+```
+
+##T2WI+ADC edema
+```{r}
+data2<-read.csv("Part1_ADC_SZ_features.csv")
+data2<-data2[,-2]
+data2<-data2[,-1]
+data5<-read.csv("Part1_OAX_T2_SZ_features.csv")
+colnames(data5) <- paste(colnames(data5),"OAX_T2_SZ",sep="_")
+data5<-data5[,-2]
+data5<-data5[,-3]
+NEWdata<-cbind(data5,data2)
+continuous_vars <- NEWdata[, c(2:1946)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1946)] <- normalized_vars
+
+
+e=0.6
+t=3
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T2WI_SZ+ADC_SZ.csv", row.names = FALSE)
+```
+
+##ADC+T1CE edema
+```{r}
+data2<-read.csv("Part1_ADC_SZ_features.csv")
+data2<-data2[,-2]
+data6<-read.csv("Part1_OCOR_T1+C_SZ_features.csv")
+colnames(data6) <- paste(colnames(data6),"OCOR_T1+C_SZ",sep="_")
+data6<-data6[,-2]
+data6<-data6[,-1]
+
+NEWdata<-cbind(data2,data6)
+continuous_vars <- NEWdata[, c(2:1947)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1947)] <- normalized_vars
+library(pROC)             
+library(pROC)             
+set.seed(g)
+
+e=0.6
+t=2
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "ADC_SZ+T1CE_SZ.csv", row.names = FALSE)
+```
+
+#T2WI+T1CE edema
+```{r}
+data5<-read.csv("Part1_OAX_T2_SZ_features.csv")
+data5<-data5[,-2]
+data5<-data5[,-3]
+data6<-read.csv("Part1_OCOR_T1+C_SZ_features.csv")
+colnames(data6) <- paste(colnames(data6),"OCOR_T1+C_SZ",sep="_")
+data6<-data6[,-2]
+data6<-data6[,-1]
+
+NEWdata<-cbind(data5,data6)
+continuous_vars <- NEWdata[, c(2:1946)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1946)] <- normalized_vars
+
+e=0.7
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T2WI_SZ+T1CE_SZ.csv", row.names = FALSE)
+
+```
+
+#ADC+T2WI+T1CE edema
+```{r}
+data2<-read.csv("Part1_ADC_SZ_features.csv")
+data2<-data2[,-2]
+data5<-read.csv("Part1_OAX_T2_SZ_features.csv")
+colnames(data5) <- paste(colnames(data5),"OAX_T2_SZ",sep="_")
+data5<-data5[,-2]
+data5<-data5[,-3]
+data5<-data5[,-1]
+data6<-read.csv("Part1_OCOR_T1+C_SZ_features.csv")
+colnames(data6) <- paste(colnames(data6),"OCOR_T1+C_SZ",sep="_")
+data6<-data6[,-2]
+data6<-data6[,-1]
+
+NEWdata<-cbind(data2,data5,data6)
+continuous_vars <- NEWdata[, c(2:2919)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:2919)] <- normalized_vars
+
+
+e=0.7
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "ADC_SZ+T2WI_SZ+T1CE_SZ.csv", row.names = FALSE)
+```
+
+##########################################################################################################################
+#ADC tumor
+```{r}
+data1<-read.csv("Part1_ADC_features.csv")
+data1<-data1[,-2]
+
+NEWdata<-data1
+continuous_vars <- NEWdata[, c(2:974)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:974)] <- normalized_vars
+
+e=0.6
+t=2
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "ADC.csv", row.names = FALSE)
+
+```
+
+#T2WI tumor
+```{r}
+data4<-read.csv("Part1_OAX_T2_features.csv")
+data4<-data4[,-2]
+data4<-data4[,-3]
+
+NEWdata<-data4
+continuous_vars <- NEWdata[, c(2:973)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:973)] <- normalized_vars
+
+e=0.6
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T2WI.csv", row.names = FALSE)
+```
+
+#T1WI tumor
+```{r}
+data3<-read.csv("Part1_OAX_T1_features.csv")
+data3<-data3[,-2]
+data3<-data3[,-3]
+
+NEWdata<-data3
+continuous_vars <- NEWdata[, c(2:973)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:973)] <- normalized_vars
+
+e=0.5
+t=10
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T1WI.csv", row.names = FALSE)
+```
+
+#T1CE tumor
+```{r}
+data7<-read.csv("Part1_T1BRAVO_features.csv")
+data7<-data7[,-2]
+
+NEWdata<-data7
+continuous_vars <- NEWdata[, c(2:974)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:974)] <- normalized_vars
+
+e=0.5
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T1CE.csv", row.names = FALSE)
+
+```
+
+######################################################################################################################
+#ADC+T2WI tumor
+```{r}
+data1<-read.csv("Part1_ADC_features.csv")
+data1<-data1[,-2]
+
+data4<-read.csv("Part1_OAX_T2_features.csv")
+colnames(data4) <- paste(colnames(data4),"OAX_T2",sep="_")
+data4<-data4[,-2]
+data4<-data4[,-3]
+data4<-data4[,-1]
+
+NEWdata<-cbind(data1,data4)
+continuous_vars <- NEWdata[, c(2:1946)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1946)] <- normalized_vars
+
+e=0.55
+t=2
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "ADC+T2WI.csv", row.names = FALSE)
+
+```
+
+
+#ADC+T1CE tumor
+```{r}
+data1<-read.csv("Part1_ADC_features.csv")
+data1<-data1[,-2]
+
+data7<-read.csv("Part1_T1BRAVO_features.csv")
+colnames(data7) <- paste(colnames(data7),"T1BRAVO",sep="_")
+data7<-data7[,-2]
+data7<-data7[,-1]
+
+NEWdata<-cbind(data1,data7)
+continuous_vars <- NEWdata[, c(2:1947)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1947)] <- normalized_vars
+
+e=0.6
+t=2
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "ADC+T1CE.csv", row.names = FALSE)
+
+```
+
+#ADC+T1WI tumor
+```{r}
+data1<-read.csv("Part1_ADC_features.csv")
+data1<-data1[,-2]
+
+data3<-read.csv("Part1_OAX_T1_features.csv")
+colnames(data3) <- paste(colnames(data3),"OAX_T1",sep="_")
+data3<-data3[,-2]
+data3<-data3[,-3]
+data3<-data3[,-1]
+
+NEWdata<-cbind(data1,data3)
+continuous_vars <- NEWdata[, c(2:1946)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1946)] <- normalized_vars
+
+e=0.5
+t=3
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "ADC+T1WI.csv", row.names = FALSE)
+```
+
+#T2WI+T1WI tumor
+```{r}
+data4<-read.csv("Part1_OAX_T2_features.csv")
+data4<-data4[,-2]
+data4<-data4[,-3]
+
+data3<-read.csv("Part1_OAX_T1_features.csv")
+colnames(data3) <- paste(colnames(data3),"OAX_T1",sep="_")
+data3<-data3[,-2]
+data3<-data3[,-3]
+data3<-data3[,-1]
+
+NEWdata<-cbind(data4,data3)
+continuous_vars <- NEWdata[, c(2:1945)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1945)] <- normalized_vars
+
+e=0.5
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T2WI+T1WI.csv", row.names = FALSE)
+
+```
+
+#T2WI+T1CE tumor
+```{r}
+data4<-read.csv("Part1_OAX_T2_features.csv")
+colnames(data4) <- paste(colnames(data4),"OAX_T2",sep="_")
+data4<-data4[,-2]
+data4<-data4[,-3]
+
+data7<-read.csv("Part1_T1BRAVO_features.csv")
+colnames(data7) <- paste(colnames(data7),"T1BRAVO",sep="_")
+data7<-data7[,-2]
+data7<-data7[,-1]
+
+NEWdata<-cbind(data4,data7)
+continuous_vars <- NEWdata[, c(2:1946)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1946)] <- normalized_vars
+
+e=0.6
+t=2
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T2WI+T1CE.csv", row.names = FALSE)
+```
+
+
+#ADC+T2WI+T1WI tumor
+```{r}
+data1<-read.csv("Part1_ADC_features.csv")
+data1<-data1[,-2]
+
+data4<-read.csv("Part1_OAX_T2_features.csv")
+colnames(data4) <- paste(colnames(data4),"OAX_T2",sep="_")
+data4<-data4[,-2]
+data4<-data4[,-3]
+data4<-data4[,-1]
+
+data3<-read.csv("Part1_OAX_T1_features.csv")
+colnames(data3) <- paste(colnames(data3),"OAX_T1",sep="_")
+data3<-data3[,-2]
+data3<-data3[,-3]
+data3<-data3[,-1]
+
+NEWdata<-cbind(data1,data4,data3)
+continuous_vars <- NEWdata[, c(2:2918)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:2918)] <- normalized_vars
+
+e=0.5
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "ADC+T2WI+T1WI.csv", row.names = FALSE)
+```
+
+#ADC+T2WI+T1CE tumor
+```{r}
+data1<-read.csv("Part1_ADC_features.csv")
+data1<-data1[,-2]
+
+data4<-read.csv("Part1_OAX_T2_features.csv")
+colnames(data4) <- paste(colnames(data4),"OAX_T2",sep="_")
+data4<-data4[,-2]
+data4<-data4[,-3]
+data4<-data4[,-1]
+
+data7<-read.csv("Part1_T1BRAVO_features.csv")
+colnames(data7) <- paste(colnames(data7),"T1BRAVO",sep="_")
+data7<-data7[,-2]
+data7<-data7[,-1]
+
+NEWdata<-cbind(data1,data4,data7)
+continuous_vars <- NEWdata[, c(2:2919)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:2919)] <- normalized_vars
+
+e=0.5
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "ADC+T2WI+T1CE.csv", row.names = FALSE)
+```
+
+#ADC+T1CE+T1WI tumor
+```{r}
+data1<-read.csv("Part1_ADC_features.csv")
+data1<-data1[,-2]
+
+data3<-read.csv("Part1_OAX_T1_features.csv")
+colnames(data3) <- paste(colnames(data3),"OAX_T1",sep="_")
+data3<-data3[,-2]
+data3<-data3[,-3]
+data3<-data3[,-1]
+
+data7<-read.csv("Part1_T1BRAVO_features.csv")
+colnames(data7) <- paste(colnames(data7),"T1BRAVO",sep="_")
+data7<-data7[,-2]
+data7<-data7[,-1]
+
+NEWdata<-cbind(data1,data3,data7)
+continuous_vars <- NEWdata[, c(2:2919)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:2919)] <- normalized_vars
+
+e=0.5
+t=3
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "ADC+T1CE+T1WI.csv", row.names = FALSE)
+
+```
+
+#T2WI+T1WI+T1CE tumor
+```{r}
+data4<-read.csv("Part1_OAX_T2_features.csv")
+data4<-data4[,-2]
+data4<-data4[,-3]
+
+data3<-read.csv("Part1_OAX_T1_features.csv")
+colnames(data3) <- paste(colnames(data3),"OAX_T1",sep="_")
+data3<-data3[,-2]
+data3<-data3[,-3]
+data3<-data3[,-1]
+
+data7<-read.csv("Part1_T1BRAVO_features.csv")
+colnames(data7) <- paste(colnames(data7),"T1BRAVO",sep="_")
+data7<-data7[,-2]
+data7<-data7[,-1]
+
+NEWdata<-cbind(data4,data3,data7)
+continuous_vars <- NEWdata[, c(2:2918)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:2918)] <- normalized_vars
+
+e=0.5
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T2WI+T1CE+T1WI.csv", row.names = FALSE)
+```
+
+
+#ADC+T2WI+T1WCE+T1WI tumor
+```{r}
+data1<-read.csv("Part1_ADC_features.csv")
+data1<-data1[,-2]
+
+data4<-read.csv("Part1_OAX_T2_features.csv")
+colnames(data4) <- paste(colnames(data4),"OAX_T2",sep="_")
+data4<-data4[,-2]
+data4<-data4[,-3]
+data4<-data4[,-1]
+
+data3<-read.csv("Part1_OAX_T1_features.csv")
+colnames(data3) <- paste(colnames(data3),"OAX_T1",sep="_")
+data3<-data3[,-2]
+data3<-data3[,-3]
+data3<-data3[,-1]
+
+data7<-read.csv("Part1_T1BRAVO_features.csv")
+colnames(data7) <- paste(colnames(data7),"T1BRAVO",sep="_")
+data7<-data7[,-2]
+data7<-data7[,-1]
+
+NEWdata<-cbind(data1,data4,data3,data7)
+continuous_vars <- NEWdata[, c(2:3891)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:3891)] <- normalized_vars
+
+e=0.5
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+write.csv(results, file = "ADC+T1CE+T1WI+T2WI.csv", row.names = FALSE)
+
+```
+
+
+#T1CE+T1WI tumor
+```{r}
+data3<-read.csv("Part1_OAX_T1_features.csv")
+data3<-data3[,-2]
+data3<-data3[,-3]
+data7<-read.csv("Part1_T1BRAVO_features.csv")
+colnames(data7) <- paste(colnames(data7),"T1BRAVO",sep="_")
+data7<-data7[,-2]
+data7<-data7[,-1]
+NEWdata<-cbind(data3,data7)
+continuous_vars <- NEWdata[, c(2:1946)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1946)] <- normalized_vars
+
+e=0.5
+t=3
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T1CE+T1WI.csv", row.names = FALSE)
+
+```
+
+###########################################################################################################
+
+#ADCSZ+T2WISZ+T1CE+T1WI tumor+edema
+```{r}
+data2<-read.csv("Part1_ADC_SZ_features.csv")
+data2<-data2[,-2]
+data5<-read.csv("Part1_OAX_T2_SZ_features.csv")
+colnames(data5) <- paste(colnames(data5),"OAX_T2_SZ",sep="_")
+data5<-data5[,-2]
+data5<-data5[,-3]
+data5<-data5[,-1]
+data3<-read.csv("Part1_OAX_T1_features.csv")
+colnames(data3) <- paste(colnames(data3),"OAX_T1",sep="_")
+data3<-data3[,-2]
+data3<-data3[,-3]
+data3<-data3[,-1]
+data7<-read.csv("Part1_T1BRAVO_features.csv")
+colnames(data7) <- paste(colnames(data7),"T1BRAVO",sep="_")
+data7<-data7[,-2]
+data7<-data7[,-1]
+
+NEWdata<-cbind(data2,data5,data3,data7)
+continuous_vars <- NEWdata[, c(2:3891)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:3891)] <- normalized_vars
+
+g=47
+e = 0.5
+t = 3
+results <- calculate_metrics(data = NEWdata)
+print(results)
+write.csv(results, file = "ADC_SZ+T2WI_SZ+T1CE+T1WI.csv", row.names = FALSE)
+
+```
+
+
+#T2wiSZ+ADC
+```{r}
+data5<-read.csv("Part1_OAX_T2_SZ_features.csv")
+data5<-data5[,-2]
+data5<-data5[,-3]
+
+
+data1<-read.csv("Part1_ADC_features.csv")
+colnames(data1) <- paste(colnames(data1),"ADC",sep="_")
+data1<-data1[,-2]
+data1<-data1[,-1]
+
+
+NEWdata<-cbind(data5,data1)
+continuous_vars <- NEWdata[, c(2:1946)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1946)] <- normalized_vars
+
+e=0.5
+t=1
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T2WI_SZ+ADC.csv", row.names = FALSE)
+
+```
+
+
+#ADCSZ+T1CE+T1WI tumor+edema
+```{r}
+data5<-read.csv("Part1_OAX_T2_SZ_features.csv")
+data5<-data5[,-2]
+data5<-data5[,-3]
+data3<-read.csv("Part1_OAX_T1_features.csv")
+colnames(data3) <- paste(colnames(data3),"OAX_T1",sep="_")
+data3<-data3[,-2]
+data3<-data3[,-3]
+data3<-data3[,-1]
+
+
+NEWdata<-cbind(data5,data3)
+continuous_vars <- NEWdata[, c(2:1945)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:1945)] <- normalized_vars
+
+e=0.5
+t=125
+results <- calculate_metrics(data = NEWdata)
+print(results)
+ write.csv(results, file = "T2WI_SZ+T1WI.csv", row.names = FALSE)
+```
+
+#Clinical data process
+```{r}
+library(openxlsx)
+library(dplyr)
+library(vctrs)
+library(rms)
+library(pROC)
+library(rmda)
+library(tidyverse)
+library(broom)
+library(scales)
+data11<-read.xlsx("patiens_clinical_data2024-10-14.xlsx")
+for(i in 3){data11[,i] <- sapply(data11[,i], as.factor)}
+for(i in 5){data11[,i] <- sapply(data11[,i], as.factor)}
+for(i in 8){data11[,i] <- sapply(data11[,i], as.factor)}
+for(i in 11:14){data11[,i] <- sapply(data11[,i], as.factor)}
+for(i in 15){data11[,i] <- sapply(data11[,i], as.numeric)}
+for(i in 16){data11[,i] <- sapply(data11[,i], as.factor)}
+for(i in 18:27){data11[,i] <- sapply(data11[,i], as.factor)}
+str(data11)
+table(data11$Sex)
+data11$HC <- relevel(data11$HC, ref = "0")
+data11$Epilepsy <- relevel(data11$Epilepsy, ref = "0")
+data11$WHOCNS <- relevel(data11$WHOCNS, ref = "0")
+data11$Type <- relevel(data11$Type, ref = "0")
+data11$Location <- relevel(data11$Location, ref = "0")
+data11$Edge <- relevel(data11$Edge, ref = "0")
+data11$Texture <- relevel(data11$Texture, ref = "0")
+data11$Shape <- relevel(data11$Shape, ref = "0")
+data11$Mass.effect3 <- relevel(data11$Mass.effect3, ref = "0")
+data11$Margin <- relevel(data11$Margin, ref = "0")
+
+
+```
+
+#Clinical data analysis
+```{r}
+set.seed(47)
+folds <- createFolds(factor(data11$group), k = k, list = TRUE, returnTrain = FALSE)
+clinical_test1 <- data11[folds[[1]],]
+clinical_train1 <- data11[-folds[[1]],]
+train_y1<-clinical_train1$group
+test_y1<-clinical_test1$group
+
+
+dd <-datadist(clinical_train1)
+options(datadist='dd')
+vars = names(clinical_train1)[3:27]
+model = tibble(vars) %>% 
+  mutate(model = map(clinical_train1[vars], 
+                   ~ glm(group ~ .x, data = clinical_train1, family = binomial()))) %>% 
+  mutate(result = map(model, tidy),
+         OR = map(model, ~ exp(coef(.x))),
+         OR_ci = map(model, ~ exp(confint(.x)))) %>% 
+  select(-model) %>% 
+  unnest(c(result, OR, OR_ci))
+
+
+model = model %>% 
+  mutate(OR_ci %>% as_tibble()) %>% 
+  select(-OR_ci) %>% 
+  rename(LL = V1, UL = V2) %>% 
+  mutate(across(term, ~ str_remove(.x, '.x'))) %>% 
+  filter(if_all(term, ~ !.x=='(Intercept)')) %>% 
+  mutate(`OR(95%CI)` = str_c(round(OR,2), ' (', round(LL,2), '-', round(UL,2), ')')) %>% 
+  select(vars, term, `OR(95%CI)`, p.value, OR, LL, UL, ) %>% 
+  mutate(p.value = pvalue(p.value))
+write.csv(model, file = "fold1-logistic-single1.csv", row.names = FALSE)
+
+library(gtsummary)
+library(broom)
+x1<-model[model$p.value < '0.05', ]
+table(x1$vars)
+f_glm <-glm(group ~ Edge+Location+Margin+Peritumoraledwma, data=clinical_train1, family = binomial)
+
+multi_model <- tidy(f_glm) %>%
+  mutate(OR = exp(estimate),  
+         LL = exp(confint(f_glm)[, 1]),  
+         UL = exp(confint(f_glm)[, 2]), 
+         `OR(95%CI)` = str_c(round(OR, 2), ' (', round(LL, 2), '-', round(UL, 2), ')')) %>%
+  select(term, `OR(95%CI)`, p.value, OR, LL, UL) %>% 
+  filter(term != '(Intercept)')  
+
+write.csv(multi_model, file = "fold1-logistic-multivariable.csv", row.names = FALSE)
+
+f_lrm <-lrm(group ~ Edge+Peritumoraledwma,data=clinical_train1, 
+            x=TRUE, y=TRUE,maxit=100)
+results <- evaluate_model_performance(f_lrm, clinical_train1, train_y1, clinical_test1, test_y1, threshold = 0.1, output_file = "model_performance.csv")
+#############################################################################################################################
+clinical_test2 <- data11[folds[[2]],]
+clinical_train2 <- data11[-folds[[2]],]
+train_y2<-clinical_train2$group
+test_y2<-clinical_test2$group
+
+dd <-datadist(clinical_train2)
+options(datadist='dd')
+
+vars = names(clinical_train2)[3:27]
+model = tibble(vars) %>% 
+  mutate(model = map(clinical_train2[vars], 
+                   ~ glm(group ~ .x, data = clinical_train2, family = binomial()))) %>% 
+  mutate(result = map(model, tidy),
+         OR = map(model, ~ exp(coef(.x))),
+         OR_ci = map(model, ~ exp(confint(.x)))) %>% 
+  select(-model) %>% 
+  unnest(c(result, OR, OR_ci))
+
+
+model = model %>% 
+  mutate(OR_ci %>% as_tibble()) %>% 
+  select(-OR_ci) %>% 
+  rename(LL = V1, UL = V2) %>% 
+  mutate(across(term, ~ str_remove(.x, '.x'))) %>% 
+  filter(if_all(term, ~ !.x=='(Intercept)')) %>% 
+  mutate(`OR(95%CI)` = str_c(round(OR,2), ' (', round(LL,2), '-', round(UL,2), ')')) %>% 
+  select(vars, term, `OR(95%CI)`, p.value, OR, LL, UL, ) %>% 
+  mutate(p.value = pvalue(p.value))
+write.csv(model, file = "fold2-logistic-single2.csv", row.names = FALSE)
+
+library(gtsummary)
+library(broom)
+x1<-model[model$p.value < '0.05', ]
+table(x1$vars)
+f_glm <-glm(group ~Bleeding+Edge+HBp+Margin+Peritumoraledwma+Shape, data=clinical_train2, family = binomial)
+
+multi_model <- tidy(f_glm) %>%
+  mutate(OR = exp(estimate), 
+         LL = exp(confint(f_glm)[, 1]), 
+         UL = exp(confint(f_glm)[, 2]),  
+         `OR(95%CI)` = str_c(round(OR, 2), ' (', round(LL, 2), '-', round(UL, 2), ')')) %>%
+  select(term, `OR(95%CI)`, p.value, OR, LL, UL) %>% 
+  filter(term != '(Intercept)') 
+
+write.csv(multi_model, file = "fold2-logistic-multivariable.csv", row.names = FALSE)
+
+f_lrm <-lrm(group ~ Edge+Peritumoraledwma,data=clinical_train2, 
+            x=TRUE, y=TRUE,maxit=100)
+results <- evaluate_model_performance(f_lrm, clinical_train2, train_y2, clinical_test2, test_y2, threshold = 0.15, output_file = "model_performance.csv")
+
+#############################################################################################################################
+clinical_test3 <- data11[folds[[3]],]
+clinical_train3 <- data11[-folds[[3]],]
+train_y3<-clinical_train3$group
+test_y3<-clinical_test3$group
+
+dd <-datadist(clinical_train3)
+options(datadist='dd')
+
+vars = names(clinical_train3)[3:27]
+model = tibble(vars) %>% 
+  mutate(model = map(clinical_train3[vars], 
+                   ~ glm(group ~ .x, data = clinical_train3, family = binomial()))) %>% 
+  mutate(result = map(model, tidy),
+         OR = map(model, ~ exp(coef(.x))),
+         OR_ci = map(model, ~ exp(confint(.x)))) %>% 
+  select(-model) %>% 
+  unnest(c(result, OR, OR_ci))
+
+
+model = model %>% 
+  mutate(OR_ci %>% as_tibble()) %>% 
+  select(-OR_ci) %>% 
+  rename(LL = V1, UL = V2) %>% 
+  mutate(across(term, ~ str_remove(.x, '.x'))) %>% 
+  filter(if_all(term, ~ !.x=='(Intercept)')) %>% 
+  mutate(`OR(95%CI)` = str_c(round(OR,2), ' (', round(LL,2), '-', round(UL,2), ')')) %>% 
+  select(vars, term, `OR(95%CI)`, p.value, OR, LL, UL, ) %>% 
+  mutate(p.value = pvalue(p.value))
+write.csv(model, file = "fold3-logistic-single3.csv", row.names = FALSE)
+
+library(gtsummary)
+library(broom)
+x1<-model[model$p.value < '0.05', ]
+table(x1$vars)
+f_glm <-glm(group ~ Edge+HbA1c+HBp+Margin+Peritumoraledwma, data=clinical_train3, family = binomial)
+
+multi_model <- tidy(f_glm) %>%
+  mutate(OR = exp(estimate),  
+         LL = exp(confint(f_glm)[, 1]),  
+         UL = exp(confint(f_glm)[, 2]),
+         `OR(95%CI)` = str_c(round(OR, 2), ' (', round(LL, 2), '-', round(UL, 2), ')')) %>%
+  select(term, `OR(95%CI)`, p.value, OR, LL, UL) %>%  
+  filter(term != '(Intercept)')  
+
+write.csv(multi_model, file = "fold3-logistic-multivariable.csv", row.names = FALSE)
+
+f_lrm <-lrm(group ~ Edge+HbA1c+Peritumoraledwma+Margin,data=clinical_train3, 
+            x=TRUE, y=TRUE,maxit=100)
+results <- evaluate_model_performance(f_lrm, clinical_train3, train_y3, clinical_test3, test_y3, threshold = 0.1, output_file = "model_performance.csv")
+
+```
+
+#Combined analysis of clinical and radiomics data
+
+```{r}
+data2<-read.csv("Part1_ADC_SZ_features.csv")
+colnames(data2) <- paste(colnames(data2),"ADC_SZ",sep="_")
+data2<-data2[,-2]
+data5<-read.csv("Part1_OAX_T2_SZ_features.csv")
+colnames(data5) <- paste(colnames(data5),"OAX_T2_SZ",sep="_")
+data5<-data5[,-2]
+data5<-data5[,-3]
+data5<-data5[,-1]
+data3<-read.csv("Part1_OAX_T1_features.csv")
+colnames(data3) <- paste(colnames(data3),"OAX_T1",sep="_")
+data3<-data3[,-2]
+data3<-data3[,-3]
+data3<-data3[,-1]
+data7<-read.csv("Part1_T1BRAVO_features.csv")
+colnames(data7) <- paste(colnames(data7),"T1BRAVO",sep="_")
+data7<-data7[,-2]
+data7<-data7[,-1]
+
+NEWdata<-cbind(data2,data5,data3,data7)
+continuous_vars <- NEWdata[, c(2:3891)]
+continuous_vars <- na.omit(continuous_vars)
+normalized_vars <- as.data.frame(scale(continuous_vars))
+NEWdata[, c(2:3891)] <- normalized_vars
+
+
+set.seed(47)
+folds <- createFolds(factor(NEWdata$Group_ADC_SZ), k = k, list = TRUE, returnTrain = FALSE)
+###########################################################################################################################
+test <- NEWdata[folds[[1]],]
+train <- NEWdata[-folds[[1]],]
+train_y<-train$Group_ADC_SZ
+test_y<-test$Group_ADC_SZ
+
+x=train[,2:3891] 
+P=0.1
+y=train[,1]
+y1=test[,1]
+n=vector()
+for (i in 1:3890){ 
+  a=wilcox.test(x[,i]~y,alternative = c("two.sided"))
+  n[i]=a$p.value
+}
+index=c(which(n<P))
+MN=x[,c(index)]
+ 
+library(glmnet)
+x1=as.matrix(MN)
+
+set.seed(125)
+cv.fit<-cv.glmnet(x1,y,family="binomial",type.measure="auc",nfolds = 10) 
+fit<-glmnet(x1,y,family="binomial", nlambda=100, alpha=1)
+coefficients<-coef(fit,s=cv.fit$lambda.min)
+Active.Index<-which(coefficients!=0)
+Active.Index <- Active.Index[-1]
+Active.coefficients<-coefficients[Active.Index]  
+Active.coefficients
+Lasso_train=x1[,c(Active.Index-1)]
+Lasso_test=test[, colnames(test) %in% colnames(Lasso_train)]
+Lasso_train=train[, colnames(train) %in% colnames(Lasso_train)]
+
+print(row.names(coefficients)[Active.Index])
+row.names(coefficients)[Active.Index]
+train_data <- data.frame(Lasso_train)
+test_data <- data.frame(Lasso_test)
+train_data$Rad_score <- 0
+test_data$Rad_score <- 0
+
+for (i in 1:nrow(train_data)) {
+  score <- sum(train_data[i, ] * Active.coefficients)
+  train_data$Rad_score[i] <- score
+}
+
+for (i in 1:nrow(test_data)) {
+  score <- sum(test_data[i, ] * Active.coefficients)
+  test_data$Rad_score[i] <- score
+}
+
+
+Rad_score<-train_data[,18]
+clinical_train1<-cbind(clinical_train1,Rad_score)
+Rad_score<-test_data[,18]
+clinical_test1<-cbind(clinical_test1,Rad_score)
+f_lrm <-lrm(group ~ Edge+Peritumoraledwma+Rad_score,data=clinical_train1, 
+            x=TRUE, y=TRUE,maxit=100)
+results <- evaluate_model_performance(f_lrm, clinical_train1, train_y1, clinical_test1, test_y1, threshold = 0.15, output_file = "conbind_model_performance.csv")
+
+###########################################################################################################################
+test <- NEWdata[folds[[2]],]
+train <- NEWdata[-folds[[2]],]
+train_y<-train$Group_ADC_SZ
+test_y<-test$Group_ADC_SZ
+
+x=train[,2:3891] 
+P=0.1
+y=train[,1]
+y1=test[,1]
+n=vector()
+for (i in 1:3890){ 
+  a=wilcox.test(x[,i]~y,alternative = c("two.sided"))
+  n[i]=a$p.value
+}
+index=c(which(n<P))
+MN=x[,c(index)]
+  
+library(glmnet)
+x1=as.matrix(MN)
+
+set.seed(125)
+cv.fit<-cv.glmnet(x1,y,family="binomial",type.measure="auc",nfolds = 10) 
+fit<-glmnet(x1,y,family="binomial", nlambda=100, alpha=1)
+coefficients<-coef(fit,s=cv.fit$lambda.min)
+Active.Index<-which(coefficients!=0)
+Active.Index <- Active.Index[-1]
+Active.coefficients<-coefficients[Active.Index]   
+Active.coefficients
+Lasso_train=x1[,c(Active.Index-1)]
+Lasso_test=test[, colnames(test) %in% colnames(Lasso_train)]
+Lasso_train=train[, colnames(train) %in% colnames(Lasso_train)]
+
+print(row.names(coefficients)[Active.Index])
+row.names(coefficients)[Active.Index]
+train_data <- data.frame(Lasso_train)
+test_data <- data.frame(Lasso_test)
+train_data$Rad_score <- 0
+test_data$Rad_score <- 0
+
+for (i in 1:nrow(train_data)) {
+  score <- sum(train_data[i, ] * Active.coefficients)
+  train_data$Rad_score[i] <- score
+}
+
+for (i in 1:nrow(test_data)) {
+  score <- sum(test_data[i, ] * Active.coefficients)
+  test_data$Rad_score[i] <- score
+}
+
+Rad_score<-train_data[,12]
+clinical_train2<-cbind(clinical_train2,Rad_score)
+Rad_score<-test_data[,12]
+clinical_test2<-cbind(clinical_test2,Rad_score)
+f_lrm <-lrm(group ~ Edge+Peritumoraledwma+Rad_score,data=clinical_train2, 
+            x=TRUE, y=TRUE,maxit=100)
+results <- evaluate_model_performance(f_lrm, clinical_train2, train_y2, clinical_test2, test_y2, threshold = -0.35, output_file = "conbind_model_performance.csv")
+######################################################################################################################################
+test <- NEWdata[folds[[3]],]
+train <- NEWdata[-folds[[3]],]
+train_y<-train$Group_ADC_SZ
+test_y<-test$Group_ADC_SZ
+
+x=train[,2:3891] 
+P=0.1
+y=train[,1]
+y1=test[,1]
+n=vector()
+for (i in 1:3890){ 
+  a=wilcox.test(x[,i]~y,alternative = c("two.sided"))
+  n[i]=a$p.value
+}
+index=c(which(n<P))
+MN=x[,c(index)]
+
+library(glmnet)
+x1=as.matrix(MN)
+
+set.seed(125)
+cv.fit<-cv.glmnet(x1,y,family="binomial",type.measure="auc",nfolds = 10) 
+fit<-glmnet(x1,y,family="binomial", nlambda=100, alpha=1)
+coefficients<-coef(fit,s=cv.fit$lambda.min)
+Active.Index<-which(coefficients!=0)
+Active.Index <- Active.Index[-1]
+Active.coefficients<-coefficients[Active.Index]  
+Active.coefficients
+Lasso_train=x1[,c(Active.Index-1)]
+Lasso_test=test[, colnames(test) %in% colnames(Lasso_train)]
+Lasso_train=train[, colnames(train) %in% colnames(Lasso_train)]
+
+print(row.names(coefficients)[Active.Index])
+row.names(coefficients)[Active.Index]
+train_data <- data.frame(Lasso_train)
+test_data <- data.frame(Lasso_test)
+train_data$Rad_score <- 0
+test_data$Rad_score <- 0
+
+for (i in 1:nrow(train_data)) {
+  score <- sum(train_data[i, ] * Active.coefficients)
+  train_data$Rad_score[i] <- score
+}
+
+for (i in 1:nrow(test_data)) {
+  score <- sum(test_data[i, ] * Active.coefficients)
+  test_data$Rad_score[i] <- score
+}
+
+Rad_score<-train_data[,13]
+clinical_train3<-cbind(clinical_train3,Rad_score)
+Rad_score<-test_data[,13]
+clinical_test3<-cbind(clinical_test3,Rad_score)
+
+f_lrm <-lrm(group ~ Edge+Peritumoraledwma++Rad_score,data=clinical_train3, 
+            x=TRUE, y=TRUE,maxit=100)
+results <- evaluate_model_performance(f_lrm, clinical_train3, train_y3, clinical_test3, test_y3, threshold = 0.5, output_file = "conbind_model_performance.csv")
+
+
+```
+
+
+#ROC curve
+```{r}
+######### Radiomics model
+f_lrm <-lrm(group ~ Rad_score,data=clinical_train3, 
+            x=TRUE, y=TRUE,maxit=100)
+pred_f_training<-predict(f_lrm,clinical_train3)
+modelroc <- roc(train_y3,pred_f_training)
+modelroc1<-modelroc
+auc_train1 <- auc(modelroc1)
+ci_train1 <- ci(modelroc1)
+pred_f_test<-predict(f_lrm,clinical_test3)
+modelroc_test <- roc(test_y3,pred_f_test)
+modelroc_test
+modelroc_test1<-modelroc_test
+auc_test1 <- auc(modelroc_test1)
+ci_test1 <- ci(modelroc_test1)
+############Clinical model
+f_lrm <-lrm(group ~ Edge+Peritumoraledwma,data=clinical_train1, 
+            x=TRUE, y=TRUE,maxit=100)
+pred_f_training<-predict(f_lrm,clinical_train1)
+modelroc <- roc(train_y1,pred_f_training)
+modelroc2<-modelroc
+auc_train2 <- auc(modelroc2)
+ci_train2 <- ci(modelroc2)
+pred_f_test<-predict(f_lrm,clinical_test1)
+modelroc_test <- roc(test_y1,pred_f_test)
+modelroc_test
+modelroc_test2<-modelroc_test
+auc_test2 <- auc(modelroc_test2)
+ci_test2 <- ci(modelroc_test2)
+##############Combined clinical and radiomics model
+f_lrm <-lrm(group ~ Edge+Peritumoraledwma+Rad_score,data=clinical_train2, 
+            x=TRUE, y=TRUE,maxit=100)
+pred_f_training<-predict(f_lrm,clinical_train2)
+modelroc <- roc(train_y2,pred_f_training)
+modelroc3<-modelroc
+auc_train3 <- auc(modelroc3)
+ci_train3 <- ci(modelroc3)
+pred_f_test<-predict(f_lrm,clinical_test2)
+modelroc_test <- roc(test_y2,pred_f_test)
+modelroc_test
+modelroc_test3<-modelroc_test
+auc_test3 <- auc(modelroc_test3)
+ci_test3 <- ci(modelroc_test3)
+
+
+ png("LR_Training_ROC.png", width = 1400, height = 1200, res = 200)
+  plot(modelroc1, col = "blue", main = "ROC Curve", xlab = "FPR", ylab = "TPR")
+  lines(modelroc2, col = "red")
+  lines(modelroc3, col = "green")
+  legend("bottomright", legend = c(
+    paste("Radiomcs AUC =", round(auc_train1, 2), "(95%CI", round(ci_train1[1], 2), "-", round(ci_train1[3], 2), ")"),
+    paste("Clinical AUC =", round(auc_train2, 2), "(95%CI", round(ci_train2[1], 2), "-", round(ci_train2[3], 2), ")"),
+    paste("Clinical+Radiomcs AUC =", round(auc_train3, 2), "(95%CI", round(ci_train3[1], 2), "-", round(ci_train3[3], 2), ")")
+  ),
+  col = c("blue", "red", "green"), lty = 1, cex = 1)
+  dev.off()
+
+
+png("LR_Validation_ROC.png", width = 1400, height = 1200, res = 200)
+plot(modelroc_test1, col = "blue", main = "ROC Curve", xlab = "FPR", ylab = "TPR")
+lines(modelroc_test2, col = "red")
+lines(modelroc_test3, col = "green")
+legend("bottomright", legend = c(
+  paste("Radiomcs AUC =", round(auc_test1, 2), "(95%CI", round(ci_test1[1], 2), "-", round(ci_test1[3], 2), ")"),
+  paste("Clinical AUC =", round(auc_test2, 2), "(95%CI", round(ci_test2[1], 2), "-", round(ci_test2[3], 2), ")"),
+  paste("Clinical+Radiomcs AUC =", round(auc_test3, 2), "(95%CI", round(ci_test3[1], 2), "-", round(ci_test3[3], 2), ")")
+),
+col = c("blue", "red", "green"), lty = 1, cex = 1)
+dev.off()
+
+```
+
+###Calibration curve
+```{r}
+library(ResourceSelection)
+model_glm <- glm(group ~ Edge+Peritumoraledwma+Rad_score,data=clinical_train2, 
+            family = binomial)
+p.hoslem <- hoslem.test(model_glm$y, fitted(model_glm), g=10)$p.value
+p.hoslem
+fit2 <- lrm(group ~ Edge+Peritumoraledwma+Rad_score,data=clinical_train2,x=T,y=T)
+cal2 <- calibrate(fit2, method='boot', B=500)
+png("Clinical and Radiomics Calibration curve-Training set.png", width = 1100, height = 1000, res = 200)
+plot(cal2,
+     xlim = c(0,1),
+     ylim = c(0,1),
+     xlab = "Prediced Probability",
+     ylab = "Observed Probability",
+     cex.lab=1.2, cex.axis=1, cex.main=1.2, cex.sub=0.8,
+     legend = FALSE
+     ) 
+lines(cal2[,c("predy","calibrated.corrected")], 
+      type = 'l', 
+      lwd = 3, 
+      pch = 16, 
+      col = "#2166AC") 
+lines(cal2[,c("predy","calibrated.orig")],type="l",pch=16,lwd=3,col="tomato")
+abline(0,1,
+       lty = 2, 
+       lwd = 2,
+       col = "#224444")
+legend(0.6,0.2,
+       c("Apparent","Bias-corrected","Ideal"), 
+       lty = c(2,1,1), 
+       lwd = c(2,3,3), 
+       col = c("black","#2166AC","tomato"), 
+       bty = "n"
+)
+text(0,0,bquote("Hosmer-Lemeshow "~italic(P)~" = "~.(round(p.hoslem,3))),adj = 0)
+title("Combined Clinical Radiomcs model-Calibration Curve")  
+dev.off()
+
+
+library(ResourceSelection)
+test_pred <- predict(f_lrm, newdata = clinical_test2)
+Pima.te <- as.data.frame(cbind(test_y2, test_pred))
+fit2 <- glm(test_y2 ~ test_pred, data = Pima.te, family = binomial)
+p.hoslem <- hoslem.test(fit2$y, fitted(fit2), g=10)$p.value
+p.hoslem
+fit2 <- lrm(test_y2 ~ test_pred, data = Pima.te, x=T, y=T)
+cal2 <- calibrate(fit2, method='boot', B=500)
+png("Clinical and Radiomics Calibration curve-Validation set.png", width = 1100, height = 1000, res = 200)
+plot(cal2,
+     xlim = c(0,1),
+     ylim = c(0,1),
+     xlab = "Prediced Probability",
+     ylab = "Observed Probability",
+     cex.lab=1.2, cex.axis=1, cex.main=1.2, cex.sub=0.8,
+     #subtitles = FALSE,
+     legend = FALSE
+     ) 
+lines(cal2[,c("predy","calibrated.corrected")], 
+      type = 'l', 
+      lwd = 3, 
+      pch = 16, 
+      col = "#2166AC") 
+lines(cal2[,c("predy","calibrated.orig")],type="l",pch=16,lwd=3,col="tomato")
+abline(0,1,
+       lty = 2, 
+       lwd = 2, 
+       col = "#224444")
+legend(0.6,0.2,
+       c("Apparent","Bias-corrected","Ideal"), 
+       lty = c(2,1,1), 
+       lwd = c(2,3,3), 
+       col = c("black","#2166AC","tomato"), 
+       bty = "n"
+)
+text(0,0,bquote("Hosmer-Lemeshow "~italic(P)~" = "~.(round(p.hoslem,3))),adj = 0)
+title("Combined Clinical Radiomcs model-Calibration Curve")  
+dev.off()
+
+
+
+
+```
+
+###Clinical decision curve
+```{r}
+
+library(rmda)
+baseline.model <- decision_curve(group ~ Edge+Peritumoraledwma+Rad_score,data=clinical_train2,
+                                 family = binomial(link = logit),
+                                 thresholds = seq(0, 1, by = .005),
+                                 bootstraps = 10)
+png("Clinical and Radiomics DCA Training.png", width = 1000, height = 1000, res = 200)            
+plot_decision_curve(baseline.model,  
+                    curve.names =  "Combined Clinical Radiomcis model",
+                    confidence.intervals = FALSE,
+                    legend.position = "bottomleft",
+                    standardize = FALSE,
+                    cost.benefit.axis = FALSE,
+                    ylim = c(-0.1, 0.5))  # 将纵坐标范围设置为-1到1.2
+dev.off()
+
+library(rmda)
+baseline.model <- decision_curve(group ~ Edge+Peritumoraledwma+Rad_score, data = clinical_test2,
+                                 family = binomial(link = logit),
+                                 thresholds = seq(0, 1, by = .005),
+                                 bootstraps = 10)
+png("Clinical and Radiomics DCA Validation.png", width = 1000, height = 1000, res = 200)            
+plot_decision_curve(baseline.model,  
+                    curve.names =  "Combined Clinical Radiomics model",
+                    confidence.intervals = FALSE,
+                    legend.position = "bottomleft",
+                    standardize = FALSE,
+                    cost.benefit.axis = FALSE,
+                    ylim = c(-0.1, 0.5))  # 将纵坐标范围设置为-1到1.2
+dev.off()
+```
+
+##Nomogram 
+```{r}
+train_data2<-clinical_train2
+train_data2 <- rename(train_data2, Tumor_boundary_adhesion = 'Edge')
+train_data2 <- rename(train_data2, Preoperative_peritumoral_edema = 'Peritumoraledwma')
+f_lrm <-lrm(group ~ Preoperative_peritumoral_edema+Tumor_boundary_adhesion+Rad_score,data=train_data2, 
+            x=TRUE, y=TRUE,maxit=100)
+
+regplot(f_lrm, plots=c("boxplot","boxes"), observation=TRUE, title="Prediction Nomogram", clickable=TRUE, points=TRUE,droplines=TRUE)
+
+```
+
+
